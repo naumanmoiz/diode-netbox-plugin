@@ -10,6 +10,7 @@ from collections import defaultdict
 
 from django.contrib.contenttypes.models import ContentType
 from extras.choices import CustomFieldTypeChoices
+from netbox.plugins import get_plugin_config
 from rest_framework import serializers
 from utilities.data import shallow_compare_dict
 
@@ -292,6 +293,7 @@ def _generate_changeset(entity: dict, object_type: str) -> ChangeSetResult:
                 entity = _partially_merge(prechange_data, entity, instance)
                 _align_cable_ends(prechange_data, entity)
                 _apply_merge_semantics(object_type, prechange_data, entity)
+                new_refs = apply_fill_only_fields(object_type, prechange_data, entity, new_refs)
                 normalize_changeset(object_type, prechange_data, entity)
             changed_data = shallow_compare_dict(
                 prechange_data, entity,
@@ -349,6 +351,83 @@ def _partially_merge(prechange_data: dict, postchange_data: dict, instance) -> d
                 result["custom_fields"][key] = value
         set_custom_field_defaults(result, instance)
     return result
+
+_FILL_ONLY_WILDCARD = "*"
+
+
+def _is_empty_value(value) -> bool:
+    """True for the values fill-only treats as "not set": None, "", [] and {}."""
+    return value is None or (isinstance(value, str | list | tuple | dict) and len(value) == 0)
+
+
+def get_fill_only_fields(object_type: str) -> frozenset[str]:
+    """
+    Return the fill-only fields configured for ``object_type``.
+
+    Read from the ``fill_only_fields`` plugin setting, a mapping of
+    "<app_label>.<model>" to a list of field names. The "*" key applies to
+    every model and is extended (never replaced) by the model's own entry.
+    Read on every call so a configuration change applies on reload.
+    """
+    config = get_plugin_config("netbox_diode_plugin", "fill_only_fields")
+    if not config:
+        return frozenset()
+    if not isinstance(config, dict):
+        logger.warning("fill_only_fields must be a dict, got %s; ignoring it", type(config).__name__)
+        return frozenset()
+    fields = set()
+    for key in (_FILL_ONLY_WILDCARD, object_type):
+        names = config.get(key)
+        if not names:
+            continue
+        if isinstance(names, str) or not isinstance(names, list | tuple | set | frozenset):
+            logger.warning("fill_only_fields[%r] must be a list of field names; ignoring it", key)
+            continue
+        fields.update(str(name) for name in names)
+    return frozenset(fields)
+
+
+def apply_fill_only_fields(
+    object_type: str, prechange_data: dict, entity: dict, new_refs: list[str]
+) -> list[str]:
+    """
+    Keep stored values for fill-only fields that are already populated.
+
+    Called on the UPDATE path only, after the incoming entity has been merged
+    with the stored state and before the two are compared. For every
+    configured field the producer sent, a non-empty stored value replaces the
+    incoming one, so the comparison sees no change and nothing is written; an
+    empty stored value (None, "", [], {}) lets the incoming value fill it.
+
+    The postchange value is set to the stored value rather than dropped so the
+    planned UPDATE data still describes the object's full resulting state, as
+    it does for merged tags and custom fields.
+
+    A reference field the producer pointed at an object created in the same
+    batch carries an unresolved reference; when the stored value wins, that
+    reference is gone, so its new_refs entries are removed too. Returns the
+    (possibly filtered) new_refs.
+    """
+    fill_only = get_fill_only_fields(object_type)
+    if not fill_only or not prechange_data:
+        return new_refs
+    kept = []
+    for field_name in sorted(fill_only):
+        if field_name not in entity or field_name not in prechange_data:
+            continue
+        stored = prechange_data[field_name]
+        if _is_empty_value(stored):
+            continue  # fill: the incoming value is applied as usual
+        entity[field_name] = copy.deepcopy(stored)
+        kept.append(field_name)
+    if not kept:
+        return new_refs
+    logger.debug("fill_only_fields kept stored %s for %s: %s", object_type, prechange_data.get("id"), kept)
+    return [
+        ref for ref in new_refs
+        if not any(ref == name or ref.startswith(f"{name}.") for name in kept)
+    ]
+
 
 def _canonicalize_termination_order(entity: dict) -> None:
     """

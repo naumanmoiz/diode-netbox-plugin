@@ -70,6 +70,22 @@ class NetBoxDiodePluginConfig(PluginConfig):
         # another scope is worse than creating a duplicate.
         "match_name_rescue_scopes": None,
 
+        # Fields an ingest may fill in but never overwrite, as
+        #   {"<app_label>.<model>": [field names]}
+        # e.g. {"ipam.ipaddress": ["description", "dns_name", "tenant"],
+        #       "dcim.device": ["description", "platform"]}.
+        # When an ingested entity matches an existing object, a listed field
+        # whose stored value is non-empty (not None, "", [] or {}) keeps that
+        # value and the incoming one is ignored, so no change is planned for
+        # it; a listed field that is still empty is filled from the payload.
+        # Applies to plain and reference (tenant, platform, role, vrf, ...)
+        # fields alike, and to updates only -- creates are unaffected. The
+        # "*" key applies to every model and a model's own entry extends it.
+        # Use it to protect values curated in NetBox from being reset by a
+        # discovery source. Empty by default: every submitted field
+        # overwrites the stored value.
+        "fill_only_fields": {},
+
         # Per-write side-effect bypasses applied during /bulk-plan-apply
         # (and the per-changeset apply path it shares with the legacy
         # /apply-change-set endpoint). Both default to False; enabling

@@ -75,6 +75,29 @@ echo $(jq -r '.[] | select(.client_id == "netbox-to-diode") | .client_secret' /p
 Note: Once you customise usernames with PLUGINS_CONFIG during first installation, you should not change or remove them
 later on. Doing so will cause the plugin to stop working properly.
 
+### Fill-only fields
+
+By default, when an ingested entity matches an existing object, every field the producer sends overwrites the stored
+value (tags and custom fields are merged). To protect values curated in NetBox, list fields that an ingest may fill
+in but never overwrite with `fill_only_fields`, keyed by `<app_label>.<model>`:
+
+```python
+PLUGINS_CONFIG = {
+    "netbox_diode_plugin": {
+        "fill_only_fields": {
+            "*": ["description"],
+            "ipam.ipaddress": ["comments", "dns_name", "status", "role", "tenant"],
+            "dcim.device": ["platform"],
+        },
+    },
+}
+```
+
+On an update, a listed field whose stored value is non-empty (not `None`, `""`, `[]` or `{}`) keeps that value and no
+change is planned for it; a listed field that is still empty is filled from the payload. Reference fields (`tenant`,
+`platform`, `role`, `vrf`, ...) and plain fields behave the same way. Creates are unaffected. The `"*"` key applies to
+every model and a model's own entry extends it. The default, `{}`, keeps the overwrite behaviour.
+
 Restart NetBox services to load the plugin:
 
 ```
