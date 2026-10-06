@@ -5,6 +5,7 @@
 import contextvars
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 from functools import cache, lru_cache
@@ -2365,6 +2366,158 @@ class AutoSlugMatcher:
         return '_auto_slug' in data
 
 
+@dataclass
+class NameRescueMatcher:
+    """
+    Match on a bare name, last, for payloads carrying no scoping fields.
+
+    NetBox scopes most name uniqueness to a parent: a Tenant's name is unique
+    within its group, a VRF is identified by its rd or by (name, tenant). An
+    ingest that knows only a name therefore matches nothing once the existing
+    row has a parent -- ObjectMatchCriteria applies its condition to the
+    queryset as well as to the payload, so ``tenant__isnull=True`` hides every
+    tenanted VRF from the very criterion meant to find it -- and a duplicate
+    is created on every pass, forever.
+
+    This matcher closes that gap without loosening anything else:
+
+    - it fires only when the payload omits every scoping field, so a payload
+      that does carry a tenant or a group is left to the real criteria;
+    - it never filters the queryset by those fields, which is the whole point
+      -- the row it is looking for is the one that has a parent;
+    - it declines when the name matches more than one row, rather than
+      guessing which was meant. Two same-named VRFs in different tenants
+      leave today's behaviour untouched;
+    - it runs after every other criterion, including AutoSlugMatcher, so it
+      only ever sees payloads nothing else could place.
+
+    It deliberately produces no fingerprint. A fingerprint asserts that two
+    payloads denote the same object, and a name alone is too weak a claim to
+    fuse batch entries on. Within a batch the first entity creates the row and
+    the next one finds it through the ordinary lookup.
+    """
+
+    model_class: type[models.Model]
+    name: str
+    scope_fields: tuple[str, ...]
+    identity_fields: tuple[str, ...] = ("name",)
+    # Scope fields the EXISTING row is still required to have null. A field
+    # gated on the payload is not automatically relaxed on the row: a VRF's rd
+    # is RFC-defined identity, so an rd-less ingest must never be folded into
+    # an rd-bearing VRF, whereas a tenant is organisational metadata the wire
+    # does not carry and folding across it is the entire point.
+    row_required_null_fields: tuple[str, ...] = ()
+
+    min_version: str | None = None
+    max_version: str | None = None
+
+    def has_required_fields(self, data: dict) -> bool:
+        """True when every identity field is present and every scoping field is not."""
+        if not all(data.get(field) not in (None, "") for field in self.identity_fields):
+            return False
+        return all(data.get(field) is None for field in self.scope_fields)
+
+    def fingerprint(self, data: dict) -> str | None:
+        """Always None: an unscoped identity is too weak to fuse two payloads on."""
+        return None
+
+    def build_queryset(self, data: dict) -> models.QuerySet:
+        """Every row with this identity, deliberately unfiltered by the scoping fields."""
+        if not self.has_required_fields(data):
+            return None
+        lookup = {}
+        for field in self.identity_fields:
+            value = data[field]
+            if isinstance(value, UnresolvedReference | dict):
+                return None
+            lookup[field] = value
+        for field in self.row_required_null_fields:
+            lookup[f"{field}__isnull"] = True
+        return self.model_class.objects.filter(**lookup)
+
+    def resolve(self, queryset, data):
+        """Bind only when the name identifies exactly one row; otherwise decline."""
+        rows = list(queryset[:2])
+        if len(rows) != 1:
+            return None
+        return rows[0]
+
+
+# object type -> (identity fields, the fields NetBox scopes that identity by).
+#
+# Every entry here is a type whose logical criteria carry a `<scope>__isnull`
+# condition. That condition filters the queryset as well as the payload, so an
+# existing row that HAS the scope is hidden from the criterion meant to find
+# it. These are precisely the types a discovery agent reports unscoped,
+# because the scope is organisational metadata NetBox holds and the wire does
+# not: which tenant owns a VRF, which group a tenant or VLAN belongs to, what
+# a cluster is scoped to.
+#
+# Deliberately absent: dcim.device and anything else scoped by site. An agent
+# does know which site it scanned, so a bare device name reaching the rescue
+# would mean the site was lost in transit, and adopting a same-named device
+# from another site is worse than creating a duplicate.
+# Each entry is (identity fields, payload gate fields, fields relaxed on the
+# existing row). A gate field not listed as relaxed must still be null on the
+# row -- see NameRescueMatcher.row_required_null_fields.
+_NAME_RESCUE_SCOPES = {
+    # rd stays strict: an rd-less ingest must not fold into an rd'd VRF.
+    "ipam.vrf": (("name",), ("rd", "tenant"), ("tenant",)),
+    "tenancy.tenant": (("name",), ("group",), ("group",)),
+    "ipam.vlangroup": (("name",), ("scope_type", "scope_id"), ("scope_type", "scope_id")),
+    "virtualization.cluster": (
+        ("name",),
+        ("scope_type", "scope_id", "group"),
+        ("scope_type", "scope_id", "group"),
+    ),
+    # vid alone repeats across a network, so the VLAN rescue also requires the
+    # name to agree. qinq_svlan stays strict: a Q-in-Q customer VLAN is a
+    # different VLAN, not the same one seen without its service tag.
+    "ipam.vlan": (("vid", "name"), ("group", "site", "qinq_svlan"), ("group", "site")),
+}
+
+
+def _name_rescue_enabled() -> bool:
+    """Read the match_name_rescue setting; uncached so a config change applies on reload."""
+    return bool(get_plugin_config("netbox_diode_plugin", "match_name_rescue"))
+
+
+def _name_rescue_scopes() -> dict:
+    """Built-in scopes, overlaid with any match_name_rescue_scopes from config."""
+    override = get_plugin_config("netbox_diode_plugin", "match_name_rescue_scopes")
+    if not override:
+        return _NAME_RESCUE_SCOPES
+    merged = dict(_NAME_RESCUE_SCOPES)
+    for object_type, spec in override.items():
+        if spec is None:
+            merged.pop(object_type, None)  # opt a type back out
+            continue
+        identity, scope = spec[0], spec[1]
+        # Omitting the third element relaxes every gated field on the row.
+        relaxed = spec[2] if len(spec) > 2 else scope
+        merged[object_type] = (tuple(identity), tuple(scope), tuple(relaxed))
+    return merged
+
+
+def _get_name_rescue_matchers(model_class) -> list:
+    """Build the name-rescue matcher for the types that need one."""
+    spec = _name_rescue_scopes().get(get_object_type(model_class))
+    if not spec:
+        return []
+    identity_fields, scope_fields, relaxed_fields = spec
+    return [
+        NameRescueMatcher(
+            model_class=model_class,
+            name=f"name_rescue_unscoped_{'_'.join(scope_fields)}",
+            identity_fields=tuple(identity_fields),
+            scope_fields=tuple(scope_fields),
+            row_required_null_fields=tuple(
+                field for field in scope_fields if field not in relaxed_fields
+            ),
+        )
+    ]
+
+
 @lru_cache(maxsize=256)
 def _get_custom_field_matchers(model_class) -> tuple:
     """Get matchers for unique custom fields (cached)."""
@@ -2402,6 +2555,9 @@ def get_model_matchers(model_class) -> list:
     matchers += _get_model_matchers(model_class)
     matchers += _get_custom_field_matchers(model_class)
     matchers += _get_autoslug_matchers(model_class)
+    # Last, so it only sees payloads no scoped criterion could place.
+    if _name_rescue_enabled():
+        matchers += _get_name_rescue_matchers(model_class)
     return matchers
 
 @lru_cache(maxsize=256)
@@ -2628,6 +2784,49 @@ def _find_obj_cache_key(data: dict, object_type: str) -> str | None:
     return f"diode:fobj:{key_hash}"
 
 
+# Diagnostics for match-or-create decisions, off unless DIODE_MATCH_DIAG is set.
+#
+# When an object is duplicated in NetBox it is because find_existing_object
+# returned None, and nothing in the ingest reports which criterion declined or
+# what it was given. This logs both, at INFO, for every lookup: the transformed
+# payload the matcher actually received, each criterion's outcome, and the final
+# decision. Additive only -- no matching behaviour changes whether it is on or
+# off, and when off the cost is one boolean test per lookup.
+_MATCH_DIAG = os.environ.get("DIODE_MATCH_DIAG", "").lower() in ("1", "true", "yes")
+
+# Transformer bookkeeping, not part of what the producer sent; omitted so the
+# line shows the identity fields the criteria actually look at.
+_DIAG_NOISE = frozenset({
+    "_object_type", "_uuid", "_refs", "_warnings", "_instance", "_netbox_id",
+})
+
+
+def _diag_payload(data: dict) -> str:
+    """
+    Compact, size-bounded rendering of the payload for a log line.
+
+    UnresolvedReference stringifies as new_object:<type>:<uuid>, which is the
+    single most useful thing here: it marks a reference this batch has not
+    created yet, and a criterion needing that field cannot build a queryset.
+    """
+    parts = []
+    for key in sorted(data):
+        if key in _DIAG_NOISE:
+            continue
+        value = data[key]
+        # _auto_slug is the slug AutoSlugMatcher will search on, and it is not
+        # in the producer's payload at all -- the transformer derives it. Worth
+        # showing, but only its value.
+        if key == "_auto_slug":
+            value = getattr(value, "value", value)
+        text = str(value)
+        if len(text) > 60:
+            text = text[:57] + "..."
+        parts.append(f"{key}={text}")
+    rendered = " ".join(parts)
+    return rendered[:600]
+
+
 def find_existing_object(data: dict, object_type: str): # noqa: C901
     """
     Find an existing object that matches the given data.
@@ -2668,12 +2867,22 @@ def find_existing_object(data: dict, object_type: str): # noqa: C901
                 django_cache.delete(cache_key)
                 django_cache.delete(_find_obj_rev_key(object_type, cached_id))
 
+    if _MATCH_DIAG:
+        logger.info("DIODE_MATCH %s lookup %s", object_type, _diag_payload(data))
+
     if not cache_hit:
         for matcher in get_model_matchers(model_class):
+            _mname = getattr(matcher, "name", None) or matcher.__class__.__name__
             if not matcher.has_required_fields(data):
+                if _MATCH_DIAG:
+                    logger.info("DIODE_MATCH %s   %s SKIP payload lacks a required field",
+                                object_type, _mname)
                 continue
             q = matcher.build_queryset(data)
             if q is None:
+                if _MATCH_DIAG:
+                    logger.info("DIODE_MATCH %s   %s SKIP condition unmet, all-null lookup, "
+                                "or an unresolved reference", object_type, _mname)
                 continue
             matchers_checked += 1
             # A matcher may own the choice among the rows its queryset returned
@@ -2685,9 +2894,20 @@ def find_existing_object(data: dict, object_type: str): # noqa: C901
                 existing = resolve(q, data)
             else:
                 existing = q.order_by('pk').first()
+            if _MATCH_DIAG:
+                logger.info("DIODE_MATCH %s   %s tried rows=%d picked=%s",
+                            object_type, _mname, q.count(),
+                            getattr(existing, "pk", None))
             if existing is not None:
                 result = existing
                 break
+
+        if _MATCH_DIAG:
+            if result is not None:
+                logger.info("DIODE_MATCH %s MATCHED id=%s", object_type, result.pk)
+            else:
+                logger.info("DIODE_MATCH %s NO MATCH after %d criteria -> a new object "
+                            "will be CREATED", object_type, matchers_checked)
 
         if cache_key and result is not None:
             django_cache.set(cache_key, result.id, cache_ttl)

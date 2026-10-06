@@ -22,6 +22,7 @@ from users.models import Owner, OwnerGroup
 from utilities.testing import APITestCase
 from virtualization.models import Cluster, VMInterface
 
+from netbox_diode_plugin.api import matcher as matcher_module
 from netbox_diode_plugin.api.authentication import DiodeOAuth2Authentication
 from netbox_diode_plugin.plugin_config import get_diode_user
 
@@ -1070,21 +1071,49 @@ class GenerateDiffAndApplyTestCase(APITestCase):
         self.assertEqual({v.tenant.name for v in vrfs}, {"Tenant F1", "Tenant F2"})
 
     def test_generate_diff_and_apply_vrf_no_rd_no_tenant_does_not_match_tenant_vrf(self):
-        """A no-tenant RD-less ingest must not collapse into a same-name VRF that has a tenant."""
-        self.diff_and_apply({
-            "timestamp": 1,
-            "object_type": "ipam.vrf",
-            "entity": {"vrf": {"name": "VRF-G", "tenant": {"name": "Tenant G"}}},
-        })
-        self.diff_and_apply({
-            "timestamp": 2,
-            "object_type": "ipam.vrf",
-            "entity": {"vrf": {"name": "VRF-G"}},
-        })
+        """With match_name_rescue off, a no-tenant RD-less ingest stays apart from a tenanted VRF."""
+        real_get_plugin_config = matcher_module.get_plugin_config
+
+        def _rescue_off(plugin, key, *args, **kwargs):
+            if key == "match_name_rescue":
+                return False
+            return real_get_plugin_config(plugin, key, *args, **kwargs)
+
+        with mock.patch.object(matcher_module, "get_plugin_config", side_effect=_rescue_off):
+            self.diff_and_apply({
+                "timestamp": 1,
+                "object_type": "ipam.vrf",
+                "entity": {"vrf": {"name": "VRF-G", "tenant": {"name": "Tenant G"}}},
+            })
+            self.diff_and_apply({
+                "timestamp": 2,
+                "object_type": "ipam.vrf",
+                "entity": {"vrf": {"name": "VRF-G"}},
+            })
         vrfs = VRF.objects.filter(name="VRF-G").order_by("pk")
         self.assertEqual(vrfs.count(), 2)
         self.assertEqual(vrfs[0].tenant.name, "Tenant G")
         self.assertIsNone(vrfs[1].tenant)
+
+    def test_generate_diff_and_apply_vrf_no_rd_no_tenant_rescues_tenant_vrf(self):
+        """By default the name rescue binds a no-tenant RD-less ingest to the one tenanted VRF."""
+        self.diff_and_apply({
+            "timestamp": 1,
+            "object_type": "ipam.vrf",
+            "entity": {"vrf": {"name": "VRF-H", "tenant": {"name": "Tenant H"}}},
+        })
+        response = self.client.post(
+            self.diff_url,
+            data={"timestamp": 2, "object_type": "ipam.vrf", "entity": {"vrf": {"name": "VRF-H"}}},
+            format="json",
+            **self.authorization_header,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # matched the existing VRF and nothing differs, so nothing to apply
+        self.assertEqual(response.json().get("change_set", {}).get("changes"), [])
+        vrfs = VRF.objects.filter(name="VRF-H")
+        self.assertEqual(vrfs.count(), 1)
+        self.assertEqual(vrfs[0].tenant.name, "Tenant H")
 
     def test_generate_diff_and_apply_ip_address_with_assigned_object_interface(self):
         """Test ip."""

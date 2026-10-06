@@ -51,6 +51,25 @@ class NetBoxDiodePluginConfig(PluginConfig):
         # communication (e.g. to show the external ingress address).
         "diode_target_display": None,
 
+        # Match an existing object by name alone, as a last resort, when the
+        # ingested payload carries none of the fields NetBox scopes that
+        # name's uniqueness by -- a VRF sent without rd or tenant, a tenant
+        # sent without a group. Without this an ingest that knows only a name
+        # cannot match a row that has a parent, and creates a duplicate
+        # instead. The rescue runs after every other criterion and declines
+        # when the name is ambiguous, so it never chooses between rows. Set
+        # to False to restore the strictly scoped behaviour.
+        "match_name_rescue": True,
+
+        # Extend or trim which object types the rescue covers, as
+        #   {"<app>.<model>": [[identity fields], [scope fields]]}
+        # merged over the built-in table (ipam.vrf, tenancy.tenant,
+        # ipam.vlan, ipam.vlangroup, virtualization.cluster). Map a type to
+        # None to opt it back out. Add a type only when its discovery source
+        # genuinely cannot know the scope -- adopting a same-named row from
+        # another scope is worse than creating a duplicate.
+        "match_name_rescue_scopes": None,
+
         # Per-write side-effect bypasses applied during /bulk-plan-apply
         # (and the per-changeset apply path it shares with the legacy
         # /apply-change-set endpoint). Both default to False; enabling
